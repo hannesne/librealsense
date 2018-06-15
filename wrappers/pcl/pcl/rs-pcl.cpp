@@ -14,6 +14,16 @@
 
 #include <pcl/compression/octree_pointcloud_compression.h>
 
+#include <cmath>
+#include <stdio.h>
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <chrono>
+#include "lepcc_c_api.h"
+#include "lepcc_types.h"
+
+
 SYSTEMTIME operator-(const SYSTEMTIME& pSr, const SYSTEMTIME& pSl);
 
 // Struct for managing rotation of pointcloud view
@@ -28,8 +38,14 @@ using pcl_rgb_ptr = pcl::PointCloud<pcl::PointXYZRGB>::Ptr;
 
 // Helper functions
 void register_glfw_callbacks(window& app, state& app_state);
+
+
 void draw_pointcloud(window& app, state& app_state, const std::vector<pcl_ptr>& points);
 void draw_pointcloud_rgb(window& app, state& app_state, const std::vector<pcl_rgb_ptr>& points);
+void draw_pointcloud_rgb2(window& app, state& app_state, std::vector<pcl::PointXYZRGB> points);
+
+void DoPCLCompression(window &app, rs2::frameset &frames, rs2::pipeline &pipe, rs2::depth_frame &depth, rs2::points &points, rs2::pointcloud &pc, rs2::video_frame &color, state app_state);
+void DoLEPCCCompression(window &app, rs2::frameset &frames, rs2::pipeline &pipe, rs2::depth_frame &depth, rs2::points &points, rs2::pointcloud &pc, rs2::video_frame &color, state app_state);
 
 
 pcl_rgb_ptr points_to_pcl(const rs2::points& points, rs2::video_frame frame)
@@ -174,36 +190,269 @@ int main(int argc, char * argv[]) try
 	rs2::frameset frames;
 	rs2::video_frame color = nullptr;
 	rs2::depth_frame depth = nullptr;
-	pcl_ptr pcl_points;
+	
+	
+	//DoPCLCompression(app, frames, pipe, depth, points, pc, color, app_state);
+	DoLEPCCCompression(app, frames, pipe, depth, points, pc, color, app_state);
 
+
+    return EXIT_SUCCESS;
+}
+catch (const rs2::error & e)
+{
+    std::cerr << "RealSense error calling " << e.get_failed_function() << "(" << e.get_failed_args() << "):\n    " << e.what() << std::endl;
+    return EXIT_FAILURE;
+}
+catch (const std::exception & e)
+{
+    std::cerr << e.what() << std::endl;
+    return EXIT_FAILURE;
+}
+
+void DoLEPCCCompression(window &app, rs2::frameset &frames, rs2::pipeline &pipe, rs2::depth_frame &depth, rs2::points &points, rs2::pointcloud &pc, rs2::video_frame &color, state app_state)
+{
+
+	lepcc_ContextHdl ctx = lepcc_createContext();
+	lepcc_ContextHdl ctxDec = lepcc_createContext();
+	lepcc_status hr;
+
+	double maxXErr = 9e-8, maxYErr = maxXErr;
+	double maxZErr = 0.01;
+
+	
+
+	vector<lepcc::Point3D> ptVec, decPtVec;
+	vector<lepcc::RGB_t> rgbVec, sortedRgbVec, decRgbVec;
+	vector<uint32_t> orderVec;
+	vector<lepcc::Byte> byteVec;
+
+
+	while (app) // Application still alive?
+	{
+
+		double totalNumPoints = 0, totalNumTiles = 0;
+		double minPts = 1e16, maxPts = 0;
+		double maxDecErrX = 0, maxDecErrY = 0, maxDecErrZ = 0;
+		double maxDecErrRGB = 0, totalDecErrRGB = 0;
+		double maxDecErrIntensity = 0, totalDecErrIntensity = 0;
+		int64_t totalNumBytesCompressed = 0;
+
+		// Wait for the next set of frames from the camera
+		frames = pipe.wait_for_frames();
+		depth = frames.get_depth_frame();
+		color = frames.get_color_frame();
+		auto colorData = (uint8_t *)frames.get_data();
+		
+		// Tell pointcloud object to map to this color frame
+		pc.map_to(color);
+
+		// Generate the pointcloud and texture mappings
+		points = pc.calculate(depth);
+			
+		points.get_profile().as<rs2::video_stream_profile>();
+
+
+		int pointCount = points.size();
+		ptVec.resize(pointCount);
+		rgbVec.resize(pointCount);
+		auto vertices = points.get_vertices();
+		auto tex_coords = points.get_texture_coordinates(); // and texture coordinates
+		int width = color.get_width();
+		int height = color.get_height();
+		auto pclPoints2 = points_to_pcl(points, color);
+		for (int i = 0; i < pointCount; i++)
+		{
+			ptVec[i].x = pclPoints2->points[i].x;
+			ptVec[i].y = pclPoints2->points[i].y;
+			ptVec[i].z = pclPoints2->points[i].z;
+			rgbVec[i].r = pclPoints2->points[i].r;
+			rgbVec[i].g = pclPoints2->points[i].g;
+			rgbVec[i].b = pclPoints2->points[i].b;
+			/*ptVec[i].x = vertices[i].x;
+			ptVec[i].y = vertices[i].y;
+			ptVec[i].z = vertices[i].z;
+
+			
+			auto coords = tex_coords[i];
+			auto color_x = (int)((coords.u) * width);
+			auto color_y = (int)((coords.v)  * height);
+			
+			if (color_x < 0 || color_x > width) {
+				continue;
+
+			}
+
+			if (color_y < 0 || color_y > height) {
+				continue;
+			}
+
+			rgbVec[i].r = *(colorData + color_x * 3 + color_y * width * 3 + 0);
+			rgbVec[i].g = *(colorData + color_x * 3 + color_y * width * 3 + 1);
+			rgbVec[i].b = *(colorData + color_x * 3 + color_y * width * 3 + 2);*/
+		}
+		orderVec.resize(pointCount);
+		
+		uint32_t nBytesXYZ = 0;
+
+		hr = lepcc_computeCompressedSizeXYZ(ctx, pointCount, (const double*)(&ptVec[0]), maxXErr, maxYErr, maxZErr, &nBytesXYZ, (uint32_t*)(&orderVec[0]));
+		if (hr)
+		{
+			printf("Error in main(): lepcc_computeCompressedSizeXYZ(...) failed.\n");  return;
+		}
+
+		uint32_t nBytesRGB = 0;
+		if (rgbVec.size() > 0)
+		{
+			if (orderVec.size() > 0)    // resort the RGB values to point order
+			{
+				sortedRgbVec.resize(pointCount);
+				for (int i = 0; i < pointCount; i++)
+					sortedRgbVec[i] = rgbVec[orderVec[i]];
+
+				hr = lepcc_computeCompressedSizeRGB(ctx, pointCount, (const lepcc::Byte*)(&sortedRgbVec[0]), &nBytesRGB);
+			}
+			else
+				hr = lepcc_computeCompressedSizeRGB(ctx, pointCount, (const lepcc::Byte*)(&rgbVec[0]), &nBytesRGB);
+
+			if (hr)
+			{
+				printf("Error in main(): lepcc_computeCompressedSizeRGB(...) failed.\n");  return;
+			}
+		}
+
+		int64_t nBytes = nBytesXYZ + nBytesRGB;
+
+		// stats
+		totalNumBytesCompressed += nBytes;
+		totalNumPoints += pointCount;
+		totalNumTiles++;
+
+		//encode
+		byteVec.resize((size_t)nBytes);
+		lepcc::Byte* buffer = &byteVec[0];
+		lepcc::Byte* pByte = buffer;
+
+		// encode
+		if (ptVec.size() > 0)
+			if (hr = lepcc_encodeXYZ(ctx, &pByte, nBytesXYZ))
+			{
+				printf("Error in main(): lepcc_encodeXYZ(...) failed.\n");  return;
+			}
+
+		if (rgbVec.size() > 0)
+			if (hr = lepcc_encodeRGB(ctx, &pByte, nBytesRGB))
+			{
+				printf("Error in main(): lepcc_encodeRGB(...) failed.\n");  return;
+			}
+
+		cout << "number of bytes for frame: " << nBytes / 1024 << "KB\n";
+
+		//decode
+		const lepcc::Byte* pByte2 = buffer;    // same buffer
+
+		uint32_t nPts2 = 0;
+
+		if (!lepcc_getPointCount(ctxDec, pByte2, nBytesXYZ, &nPts2) && nPts2 > 0)
+		{
+			decPtVec.resize(nPts2);
+			if (hr = lepcc_decodeXYZ(ctxDec, &pByte2, nBytesXYZ, &nPts2, (double*)(&decPtVec[0])))
+			{
+				printf("Error in main(): lepcc_decodeXYZ(...) failed.\n");  return;
+			}
+
+			// compare
+			for (int i = 0; i < (int)nPts2; i++)
+			{
+				int k = orderVec[i];
+				const lepcc::Point3D* p = &ptVec[k];
+				const lepcc::Point3D* q = &decPtVec[i];
+
+				double dx = abs(q->x - p->x);
+				double dy = abs(q->y - p->y);
+				double dz = abs(q->z - p->z);
+
+				maxDecErrX = max(dx, maxDecErrX);
+				maxDecErrY = max(dy, maxDecErrY);
+				maxDecErrZ = max(dz, maxDecErrZ);
+			}
+		}
+
+		if (!lepcc_getRGBCount(ctxDec, pByte2, nBytesRGB, &nPts2) && nPts2 > 0)
+		{
+			decRgbVec.resize(nPts2);
+			if (hr = lepcc_decodeRGB(ctxDec, &pByte2, nBytesRGB, &nPts2, (lepcc::Byte*)(&decRgbVec[0])))
+			{
+				printf("Error in main(): lepcc_decodeRGB(...) failed.\n");  return;
+			}
+
+			// compare
+			bool resortedColors = !orderVec.empty();
+
+			for (int i = 0; i < (int)nPts2; i++)
+			{
+				int k = resortedColors ? orderVec[i] : i;
+				lepcc::RGB_t rgbEnc = rgbVec[k];
+				lepcc::RGB_t rgbDec = decRgbVec[i];
+
+				double dx = rgbDec.r - rgbEnc.r;
+				double dy = rgbDec.g - rgbEnc.g;
+				double dz = rgbDec.b - rgbEnc.b;
+				double delta = sqrt(dx * dx + dy * dy + dz * dz);
+
+				maxDecErrRGB = max(delta, maxDecErrRGB);
+				totalDecErrRGB += delta;
+			}
+		}
+
+
+		std::vector<pcl::PointXYZRGB> pclPoints(nPts2);
+
+		for (int i = 0; i < (int)nPts2; i++)
+		{
+			pclPoints[i].r = rgbVec[i].r;
+			pclPoints[i].g = rgbVec[i].g;
+			pclPoints[i].b = rgbVec[i].b;
+			pclPoints[i].x = ptVec[i].x;
+			pclPoints[i].y = ptVec[i].y;
+			pclPoints[i].z = ptVec[i].z;
+
+		}
+
+		draw_pointcloud_rgb2(app, app_state, pclPoints);
+		
+
+		double nBytesPerPt = (double)totalNumBytesCompressed / (double)totalNumPoints;
+
+		std::cout << "tiles  =  " << totalNumTiles << endl;
+		std::cout << "points =  " << totalNumPoints << endl;
+		std::cout << "max decoding error in [x, y, z] = [ " << maxDecErrX << ", " << maxDecErrY << ", " << maxDecErrZ << " ]" << endl;
+		std::cout << "max decoding error in RGB = " << maxDecErrRGB << endl;
+		std::cout << "mean decoding error in RGB = " << totalDecErrRGB / totalNumPoints << endl;
+		std::cout << "max decoding error in intensity = " << maxDecErrIntensity << endl;
+		std::cout << "mean decoding error in intensity = " << totalDecErrIntensity / totalNumPoints << endl;
+		
+
+	}
+
+	lepcc_deleteContext(&ctx);
+}
+
+void DoPCLCompression(window &app, rs2::frameset &frames, rs2::pipeline &pipe, rs2::depth_frame &depth, rs2::points &points, rs2::pointcloud &pc, rs2::video_frame &color, state app_state)
+{
+	pcl_ptr pcl_points;
 	//compression
-bool showStatistics = true;
-//	bool showStatistics = false;
+	bool showStatistics = true;
+	//	bool showStatistics = false;
 
 	// for a full list of profiles see: /io/include/pcl/compression/compression_profiles.h
 	//pcl::io::compression_Profiles_e compressionProfileRGB = pcl::io::MED_RES_ONLINE_COMPRESSION_WITH_COLOR;
-pcl::io::compression_Profiles_e compressionProfileRGB = pcl::io::MED_RES_OFFLINE_COMPRESSION_WITH_COLOR;
-pcl::io::compression_Profiles_e compressionProfile = pcl::io::MED_RES_ONLINE_COMPRESSION_WITHOUT_COLOR;
+	pcl::io::compression_Profiles_e compressionProfileRGB = pcl::io::MED_RES_OFFLINE_COMPRESSION_WITH_COLOR;
+	pcl::io::compression_Profiles_e compressionProfile = pcl::io::MED_RES_ONLINE_COMPRESSION_WITHOUT_COLOR;
 
-	// instantiate point cloud compression for encoding and decoding
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(compressionProfileRGB, showStatistics);
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(compressionProfileRGB, showStatistics, 0.001, 0.01, false, 30U);
-//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(compressionProfileRGB, showStatistics, 0.001, 0.01, true, 1U);
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(compressionProfileRGB, showStatistics);
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(pcl::io::MANUAL_CONFIGURATION, showStatistics, 0.001, 0.01, false, 1U);
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(pcl::io::MANUAL_CONFIGURATION, showStatistics, 0.001, 0.01, false, 0U);
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(pcl::io::MANUAL_CONFIGURATION, showStatistics, 0.001, 0.01, true, 10U);x
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(pcl::io::MANUAL_CONFIGURATION, showStatistics, 0.0005, 0.003, true, 10U);
-	///auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(pcl::io::MANUAL_CONFIGURATION, showStatistics, 0.0005, 0.003, true, 1U);
-auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(pcl::io::MANUAL_CONFIGURATION, showStatistics, 0.0002, 0.003, true, 0U);
-//	auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(compressionProfileRGB, showStatistics);
+	auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>(pcl::io::MANUAL_CONFIGURATION, showStatistics, 0.0002, 0.003, true, 0U);
 
 	auto PointCloudDecoderRGB = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGB>();
-	//auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl_rgb_ptr>(compressionProfileRGB, showStatistics);
-//	auto 	PointCloudEncoder = new pcl::io::OctreePointCloudCompression<pcl::PointXYZ>(compressionProfile, showStatistics);
-//	auto PointCloudDecoder = new pcl::io::OctreePointCloudCompression<pcl::PointXYZRGBA>();
-
-
+	
 	int filtered_size = 0;
 	int cloudSize = 0;
 	int cumulativeDataLength = 0;
@@ -223,10 +472,10 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 	SYSTEMTIME endTime;
 	GetLocalTime(&startTime);
 	GetLocalTime(&endTime);
-//	int cumulativeDataLength = 0;
+	//	int cumulativeDataLength = 0;
 
-    while (app) // Application still alive?
-    {
+	while (app) // Application still alive?
+	{
 		// Wait for the next set of frames from the camera
 		frames = pipe.wait_for_frames();
 
@@ -247,13 +496,13 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 
 		/*
 		{
-			auto tex_coords = points.get_texture_coordinates(); // and texture coordinates
-																//for (int i = 0; i < points.size(); i++)
-			for (int i = 0; i < 100; i++)
-			{
-				auto coords = tex_coords[i];
-				std::cout << coords.u << "," << coords.v << std::endl;
-			}
+		auto tex_coords = points.get_texture_coordinates(); // and texture coordinates
+		//for (int i = 0; i < points.size(); i++)
+		for (int i = 0; i < 100; i++)
+		{
+		auto coords = tex_coords[i];
+		std::cout << coords.u << "," << coords.v << std::endl;
+		}
 
 
 		}
@@ -289,7 +538,7 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 		*/
 		/*
 		if (filtered_size == 0) {
-			filtered_size = cloud_filtered->size();
+		filtered_size = cloud_filtered->size();
 		}
 
 		*/
@@ -299,9 +548,9 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 			cloudSize = filteredSize;
 		else
 		{
-			float differenceFactor = ((float)(filteredSize - cloudSize) / cloudSize);
+			float differenceFactor = std::abs((float)(filteredSize - cloudSize) / cloudSize);
 			//cout << "differenceFactor: " << differenceFactor << "\n";
-			if (differenceFactor > 0.1 || frameCounter ++ % 5)
+			if (differenceFactor > 0.1 || (frameCounter++ % 5 == 0))
 			{
 				cloudSize = filteredSize;
 				PointCloudEncoderRGB->switchBuffers();
@@ -319,25 +568,25 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 
 		auto original_size = cloud_filtered->size();
 		if (original_size > filtered_size) {
-			cloud_filtered->resize(filtered_size);
-			std::cout << "reduce" << std::endl;
+		cloud_filtered->resize(filtered_size);
+		std::cout << "reduce" << std::endl;
 		}
 		else {
-			std::cout << "add dummy data" << std::endl;
+		std::cout << "add dummy data" << std::endl;
 
-			cloud_filtered->resize(filtered_size);
+		cloud_filtered->resize(filtered_size);
 
-			for (int i = original_size; i < filtered_size; i++)
-			{
-				// upload the point and texture coordinates only for points we have depth data for
-				cloud_filtered->points[i].x = 0;
-				cloud_filtered->points[i].y = 0;
-				cloud_filtered->points[i].z = 0;
-				cloud_filtered->points[i].r = 0;
-				cloud_filtered->points[i].g = 0;
-				cloud_filtered->points[i].b = 0;
+		for (int i = original_size; i < filtered_size; i++)
+		{
+		// upload the point and texture coordinates only for points we have depth data for
+		cloud_filtered->points[i].x = 0;
+		cloud_filtered->points[i].y = 0;
+		cloud_filtered->points[i].z = 0;
+		cloud_filtered->points[i].r = 0;
+		cloud_filtered->points[i].g = 0;
+		cloud_filtered->points[i].b = 0;
 
-			}
+		}
 		}
 
 		*/
@@ -355,13 +604,14 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 		//switchBuffer reduces noise
 		/*
 		if (++switch_buffer_counter >= switch_buffer_rate) {
-			PointCloudEncoderRGB->switchBuffers();
-			switch_buffer_counter = 0;
+		PointCloudEncoderRGB->switchBuffers();
+		switch_buffer_counter = 0;
 		}
 		*/
 		//PointCloudEncoderRGB->switchBuffers();
-
-		PointCloudEncoderRGB->encodePointCloud(cloud_filtered, compressedData);
+		
+		PointCloudEncoderRGB->encodePointCloud(pcl_rgb_points, compressedData);
+		//PointCloudEncoderRGB->encodePointCloud(cloud_filtered, compressedData);
 
 
 		// calculate data size
@@ -387,35 +637,35 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 
 
 		/*
-		 compressedData.seekp(0, ios::end);
-		 stringstream::pos_type offset = compressedData.tellp();
-		 std::cout << offset << std::endl;
+		compressedData.seekp(0, ios::end);
+		stringstream::pos_type offset = compressedData.tellp();
+		std::cout << offset << std::endl;
 
 
-		 
-		 calc_compression_index++;
-		 if (calc_compression_index == calc_compression_rate) {
-			 compression_data_size += (int)offset;
-			 std::cout << compression_data_size / calc_compression_rate << "Bytes" << std::endl;
-			 compression_data_size = 0;
-			 calc_compression_index = 0;
-		 }
-		 */
+
+		calc_compression_index++;
+		if (calc_compression_index == calc_compression_rate) {
+		compression_data_size += (int)offset;
+		std::cout << compression_data_size / calc_compression_rate << "Bytes" << std::endl;
+		compression_data_size = 0;
+		calc_compression_index = 0;
+		}
+		*/
 
 
 
 
 		//try {
 
-			/*
-			if (cloud_filtered != nullptr) {
-				PointCloudEncoderRGB->encodePointCloud(cloud_filtered, compressedData);
-			}
-			*/
+		/*
+		if (cloud_filtered != nullptr) {
+		PointCloudEncoderRGB->encodePointCloud(cloud_filtered, compressedData);
+		}
+		*/
 
 
 
-			/**/
+		/**/
 		// draw point cloud
 		std::vector<pcl_rgb_ptr> layers_rgb;
 		//layers_rgb.push_back(pcl_rgb_points);
@@ -426,8 +676,8 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 
 
 
-			continue;
-			/*
+		continue;
+		/*
 		std::vector<pcl_rgb_ptr> layers_rgb;
 		//layers_rgb.push_back(pcl_rgb_points);
 		layers_rgb.push_back(cloud_filtered);
@@ -436,7 +686,7 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 
 		}
 		catch (exception e) {
-			std::cerr << e.what() << std::endl;
+		std::cerr << e.what() << std::endl;
 		}
 
 
@@ -456,7 +706,7 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 
 		pass.filter(*cloud_filtered);
 
-		// compress 
+		// compress
 		std::stringstream compressedData;
 		// output pointcloud
 		pcl::PointCloud<pcl::PointXYZ>::Ptr cloudOut(new pcl::PointCloud<pcl::PointXYZ>());
@@ -473,24 +723,13 @@ auto 	PointCloudEncoderRGB = new pcl::io::OctreePointCloudCompression<pcl::Point
 		layers.push_back(cloud_filtered);
 
 
-        draw_pointcloud(app, app_state, layers);
+		draw_pointcloud(app, app_state, layers);
 		*/
 
 		continue;
-    }
+	}
+}
 
-    return EXIT_SUCCESS;
-}
-catch (const rs2::error & e)
-{
-    std::cerr << "RealSense error calling " << e.get_failed_function() << "(" << e.get_failed_args() << "):\n    " << e.what() << std::endl;
-    return EXIT_FAILURE;
-}
-catch (const std::exception & e)
-{
-    std::cerr << e.what() << std::endl;
-    return EXIT_FAILURE;
-}
 
 // Registers the state variable and callbacks to allow mouse control of the pointcloud
 void register_glfw_callbacks(window& app, state& app_state)
@@ -641,6 +880,57 @@ void draw_pointcloud_rgb(window& app, state& app_state, const std::vector<pcl_rg
 
 		glEnd();
 	}
+
+	// OpenGL cleanup
+	glPopMatrix();
+	glMatrixMode(GL_PROJECTION);
+	glPopMatrix();
+	glPopAttrib();
+	glPushMatrix();
+}
+
+void draw_pointcloud_rgb2(window& app, state& app_state, std::vector<pcl::PointXYZRGB> points)
+{
+	// OpenGL commands that prep screen for the pointcloud
+	glPopMatrix();
+	glPushAttrib(GL_ALL_ATTRIB_BITS);
+
+	float width = app.width(), height = app.height();
+
+	glClearColor(153.f / 255, 153.f / 255, 153.f / 255, 1);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	glMatrixMode(GL_PROJECTION);
+	glPushMatrix();
+	gluPerspective(60, width / height, 0.01f, 10.0f);
+
+	glMatrixMode(GL_MODELVIEW);
+	glPushMatrix();
+	gluLookAt(0, 0, 0, 0, 0, 1, 0, -1, 0);
+
+	glTranslatef(0, 0, +0.5f + app_state.offset_y*0.05f);
+	glRotated(app_state.pitch, 1, 0, 0);
+	glRotated(app_state.yaw, 0, 1, 0);
+	glTranslatef(0, 0, -0.5f);
+
+	glPointSize(width / 640);
+	glEnable(GL_TEXTURE_2D);
+
+	int color = 0;
+
+	for (int i = 0; i < points.size(); i++)
+	{
+		auto&& p = points[i];
+		if (p.z)
+		{
+			// upload the point and texture coordinates only for points we have depth data for
+			glVertex3f(p.x, p.y, p.z);
+
+			glColor3f((float)p.r / 255.0, (float)p.g / 255.0, (float)p.b / 255.0);
+		}
+	}
+
+	glEnd();
 
 	// OpenGL cleanup
 	glPopMatrix();
